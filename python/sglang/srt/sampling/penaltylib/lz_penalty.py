@@ -6,33 +6,53 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
     _BatchedPenalizer,
 )
 
-def compute_row_encoding_cost(x: torch.Tensor) -> torch.Tensor:
+def compute_lz_encoding_cost(x: torch.Tensor) -> torch.Tensor:
     """
-    Computes, for each row, the minimum over columns of:
-      (log(n - i + 1) + log(x_i)) / x_i
-    for valid x_i > 0.
-    This is a variation of the LZSS / LZ77 sliding window matching algorithm.
-    Works for both 2D and higher dimensional tensors, operating on the last dimension.
+    Computes the LZ encoding cost for each row of x.
+    This implementation is based on the formula from lz_penalty.tex:
+    - Find the best match (longest length, then smallest distance).
+    - Return log(distance) for the best match.
     """
-    n = x.size(-1)
-    indices = torch.arange(n, dtype=torch.float, device=x.device)
-    # Add singleton dimensions to broadcast correctly for both 2D and higher dims
-    log_term = torch.log2(n - indices + 1)
-    log_term = log_term.view(*([1] * (x.dim() - 1)), -1)
+    if x.numel() == 0:
+        out_shape = list(x.shape)[:-1]
+        return torch.full(out_shape, float('inf'), device=x.device, dtype=torch.float)
 
-    x = x.float()
-    
-    # Create a mask for valid x_i > 0
+    n = x.size(-1)
+    if n == 0:
+        out_shape = list(x.shape)[:-1]
+        return torch.full(out_shape, float('inf'), device=x.device, dtype=torch.float)
+
+    # Invert indices for distance calculation (farthest is smallest index)
+    indices = torch.arange(n - 1, -1, -1, dtype=torch.float, device=x.device)
+    # Add singleton dimensions to broadcast correctly for both 2D and higher dims
+    indices_view = indices.view(*([1] * (x.dim() - 1)), -1)
+
+    # Use a large constant to represent invalid distances
+    inf_distances = torch.full_like(x, float('inf'))
+
+    # Mask for valid matches (x > 0)
     mask = x > 0
-    # Compute log(x) only where valid, set invalid ones to inf (since we take min)
-    log_x = torch.where(mask, torch.log2(x), torch.full_like(x, float('inf')))
+
+    # Get distances for valid matches
+    distances = torch.where(mask, indices_view.expand_as(x) + 1, inf_distances)
+
+    # Find the maximum length for each row
+    max_len = torch.max(x, dim=-1, keepdim=True).values
+
+    # A match is a "best" match if it has the maximum length
+    # and it is a valid match.
+    best_len_mask = (x == max_len) & mask
+
+    # Get distances of best-length matches, others are inf
+    best_len_distances = torch.where(best_len_mask, distances, inf_distances)
+
+    # The best match is the one with the minimum distance among those with max length
+    min_dist = torch.min(best_len_distances, dim=-1).values
+
+    # Cost is log2 of the best distance. If no match, cost is inf.
+    cost = torch.where(min_dist != float('inf'), torch.log2(min_dist), torch.full_like(min_dist, float('inf')))
     
-    # Elementwise compute (log_term + log_x) / x.
-    # For invalid entries, set to inf.
-    value = torch.where(mask, (log_term + log_x) / x, torch.full_like(x, float('inf')))
-    
-    # Return the minimum value along last dimension
-    return torch.min(value, dim=-1).values
+    return cost
 
 
 def compute_reversed_consecutive_counts(E: torch.BoolTensor) -> torch.Tensor:
@@ -73,7 +93,7 @@ def compute_lz_penalty_stateless(W_context: torch.Tensor,
     M = (G_vocab.unsqueeze(1) == match_context.unsqueeze(0)).int()
     RP = (M * U) + M
     log_vocab = math.log2(len(G_vocab))
-    RP = torch.clamp(compute_row_encoding_cost(RP), min=0.0, max=log_vocab)
+    RP = torch.clamp(compute_lz_encoding_cost(RP), min=0.0, max=log_vocab)
     return log_vocab - RP
 
 
@@ -113,7 +133,7 @@ def compute_lz_penalty_batched(W_context: torch.Tensor,
     M = M.permute(2,0,1)
     K = (M * U) + M
     log_vocab = math.log2(len(G_vocab))
-    RP = torch.clamp(compute_row_encoding_cost(K), min=0.0, max=log_vocab).t()
+    RP = torch.clamp(compute_lz_encoding_cost(K), min=0.0, max=log_vocab).t()
     return log_vocab - RP
     
 
